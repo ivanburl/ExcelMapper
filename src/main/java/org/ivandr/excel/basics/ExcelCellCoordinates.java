@@ -1,6 +1,7 @@
-package org.ivandr.excel.mapper;
+package org.ivandr.excel.basics;
 
 import lombok.NonNull;
+import lombok.Setter;
 
 public record ExcelCellCoordinates(int row, int column) {
     public static ExcelCellCoordinates sum(@NonNull ExcelCellCoordinates a, @NonNull ExcelCellCoordinates b) {
