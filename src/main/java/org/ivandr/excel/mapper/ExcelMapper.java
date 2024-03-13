@@ -13,5 +13,5 @@ public interface ExcelMapper<WS, T> {
     void mapToExcelSheet(
             @NonNull WS worksheet,
             int startRow, int startColumn,
-            @NonNull T object);
+            T object);
 }
