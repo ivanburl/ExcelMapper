@@ -25,7 +25,7 @@ public class Main {
         var end  = System.nanoTime();
 
         var people = Instancio.of(People.class)
-                .withSettings(Settings.defaults().set(Keys.MAX_DEPTH, 4))
+                .withSettings(Settings.defaults().set(Keys.MAX_DEPTH, 10))
                 .lenient().create();
 
 
