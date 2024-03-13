@@ -36,7 +36,7 @@ public @interface ExcelExportObject {
      * fall back value in case null getter returning null
      */
     @NonNull
-    String valueFallback() default "NULL";
+    String valueFallback() default "";
 
     /**
      * whether to look for {@link ExcelExportObject} annotation deeper

@@ -3,10 +3,9 @@ package org.ivandr.excel.mapper.fastexcel;
 import com.google.common.graph.Graph;
 import com.google.common.graph.ImmutableGraph;
 import com.google.common.graph.Traverser;
-import lombok.AllArgsConstructor;
 import lombok.Getter;
 import lombok.NonNull;
-import lombok.Setter;
+import lombok.SneakyThrows;
 import org.dhatim.fastexcel.StyleSetter;
 import org.dhatim.fastexcel.Worksheet;
 import org.ivandr.excel.annotations.ExcelCellStyle;
@@ -35,7 +34,7 @@ public class FastExcelMapper<T> implements ExcelMapper<Worksheet, T> {
     @NonNull
     private final ImmutableGraph<FastExcelMappingNode> treeGraph;
     /**
-     * leaves are in the same order as in tree (insertation order)
+     * leaves are in the same order as in tree (insertion order)
      */
     @NonNull
     private final List<FastExcelMappingNode> leaves;
@@ -45,7 +44,7 @@ public class FastExcelMapper<T> implements ExcelMapper<Worksheet, T> {
         this.treeGraph = ImmutableGraph.copyOf(treeGraph);
 
         if (!treeGraph.nodes().contains(root))
-            throw new IllegalStateException("Root is not the part of graph");
+            throw new IllegalArgumentException("Root is not the part of graph");
 
         this.leaves = this.treeGraph.nodes().stream()
                 .filter(n -> this.treeGraph.successors(n).isEmpty())
@@ -106,7 +105,7 @@ public class FastExcelMapper<T> implements ExcelMapper<Worksheet, T> {
     }
 
     @Override
-    public void mapToExcelSheet(@NonNull Worksheet worksheet, int startRow, int startColumn, @NonNull T object) {
+    public void mapToExcelSheet(@NonNull Worksheet worksheet, int startRow, int startColumn, T object) {
         mapHeadersToExcelSheet(startRow, startColumn, worksheet);
         mapValuesToExcelSheet(worksheet, startRow, startColumn, object);
     }
@@ -114,8 +113,6 @@ public class FastExcelMapper<T> implements ExcelMapper<Worksheet, T> {
     private void mapHeadersToExcelSheet(
             int startRow, int startColumn,
             @NonNull Worksheet worksheet) {
-//        var coordinates = new ArrayDeque<ExcelCellCoordinates>();
-//        coordinates.add(new ExcelCellCoordinates(startRow, startColumn));
         var nodesWithCoordinates = new ArrayDeque<FastExcelNodeWithCoordinates>();
         nodesWithCoordinates.add(new FastExcelNodeWithCoordinates(
                         this.root,
@@ -125,8 +122,8 @@ public class FastExcelMapper<T> implements ExcelMapper<Worksheet, T> {
 
         while (!nodesWithCoordinates.isEmpty()) {
             var nodeWithCoordinate = nodesWithCoordinates.pop();
-            var parent = nodeWithCoordinate.getNode();
-            var parentCoordinates = nodeWithCoordinate.getCoordinates();
+            var parent = nodeWithCoordinate.node();
+            var parentCoordinates = nodeWithCoordinate.coordinates();
 
             var children = this.treeGraph.successors(parent)
                     .stream()
@@ -149,8 +146,6 @@ public class FastExcelMapper<T> implements ExcelMapper<Worksheet, T> {
                 styleSetter.merge();
                 applyStyleToCell(styleSetter, child.getExportMetaInfo().get().headerStyle());
 
-                //TODO replace with FastExcelNodeWithCoordinates
-//                nodes.add(child);
                 nodesWithCoordinates.add(
                         new FastExcelNodeWithCoordinates(
                                 child,
@@ -172,225 +167,181 @@ public class FastExcelMapper<T> implements ExcelMapper<Worksheet, T> {
     private void mapValuesToExcelSheet(
             @NonNull Worksheet worksheet,
             int startRow, int startColumn,
-            @NonNull T value) {
+            T value) {
 
-        //Init column pointers with basic values
-        HashMap<FastExcelMappingNode, List<FastExcelCoordinatesWithValue>> columnExportPointers =
-                createColumnValueExportPointers(startRow, startColumn);
+        // index - treeHeight,
+        // value - accumulatedMaximalCellNumber (the cell number required for specified tree height
+        // including all children of current height)
+        List<Integer> accumulatedMaximalCellNumberByTreeHeight = getAccumulatedMaximalCellNumberByHeight(value);
 
-        // Produce column pointers
+        HashMap<FastExcelMappingNode, List<Object>> exportObjectsByLeaf = getObjectsToExport(
+                accumulatedMaximalCellNumberByTreeHeight,
+                value
+        );
+
+        int maxTreeHeight = accumulatedMaximalCellNumberByTreeHeight.size();
+        for (int i = 0; i < this.leaves.size(); i++) {
+            var leaf = this.leaves.get(i);
+            var exportMetaInfo = leaf.getExportMetaInfo()
+                    .orElseThrow(() -> new IllegalStateException("Node without meta info, could not continue"));
+
+
+            var listOfObjects = exportObjectsByLeaf.getOrDefault(this.leaves.get(i), new ArrayList<>());
+            var leafTreeHeight = leaf.getTreeHeight();
+            int sizePerObject = !leaf.isCollectionMapping() ?
+                    accumulatedMaximalCellNumberByTreeHeight.get(leafTreeHeight) :
+                    leafTreeHeight + 1 == maxTreeHeight ?
+                            1 :
+                            accumulatedMaximalCellNumberByTreeHeight.get(leafTreeHeight + 1);
+            int topRow = startRow + maxTreeHeight - 1;
+            for (var o : listOfObjects) {
+                int leftColumn = startColumn + i;
+
+                worksheet.value(topRow, leftColumn, o == null ? exportMetaInfo.valueFallback() : o.toString());
+                var styleSetter = worksheet.range(topRow, leftColumn,
+                        topRow + sizePerObject - 1, leftColumn).style();
+                applyStyleToCell(styleSetter, exportMetaInfo.valueStyle());
+                styleSetter.set();
+                styleSetter.merge().set();
+                topRow += sizePerObject;
+            }
+        }
+
+    }
+
+    private List<Integer> getAccumulatedMaximalCellNumberByHeight(T value) {
+        HashMap<Integer, Integer> cellNumberByHeight = new HashMap<>();
+
         var stack = new ArrayDeque<FastExcelNodeWithValue>();
         stack.add(new FastExcelNodeWithValue(
                 this.root,
                 value
         ));
 
+        int maxTreeHeight = 0;
         while (!stack.isEmpty()) {
             var parent = stack.pop();
-            var children = this.treeGraph.successors(parent.getNode());
-            //System.out.printf("Passed %d%n", children.size());
-            //System.out.println(children);
+            maxTreeHeight = Math.max(parent.node().getTreeHeight(), maxTreeHeight);
+
+            var children = this.treeGraph.successors(parent.node());
 
             stack.addAll(
                     children
                             .stream()
-                            .map(n -> {
-                                        if (parent.getValue() == null)
-                                            return new FastExcelNodeWithValue(n, null);
+                            .flatMap(n -> {
+                                Object gotValue = getValueFromNode(n, parent.value());
 
+                                Stream<?> resStream = Stream.of(gotValue);
+                                if (n.isCollectionMapping() && gotValue instanceof Collection<?> coll) {
+                                    cellNumberByHeight.compute(n.getTreeHeight(),
+                                            (k, v) -> Math.max(1, v == null ? coll.size() : Math.max(v, coll.size())));
+                                    resStream = coll.stream();
+                                }
+                                return resStream.map(o -> new FastExcelNodeWithValue(n, o));
+                            }).toList()
+            );
+        }
 
-                                        var parentValueStream = parent.getValue() instanceof Collection<?> coll ?
-                                                coll.stream() : Stream.of(parent.getValue());
+        var res = new ArrayList<Integer>(maxTreeHeight + 1);
+        for (int i = 0; i <= maxTreeHeight; i++) {
+            res.add(cellNumberByHeight.getOrDefault(i, 1));
+        }
 
-                                        Stream<?> valueStream = Stream.of((Object) null);
-                                        if (n.getValueGetter().isPresent()) {
-                                            var getter = n.getValueGetter().get();
-                                            valueStream = parentValueStream
-                                                    .map(v -> {
-                                                        if (v == null) return null;
-                                                        return getter.apply(v);
-                                                    });
+        for (int i = res.size() - 2; i >= 0; i--) {
+            res.set(i, res.get(i + 1) * res.get(i));
+        }
 
-                                        } else if (n.getCollectionGetter().isPresent()) {
-                                            var getter = n.getCollectionGetter().get();
-                                            valueStream = parentValueStream
-                                                    .flatMap(v -> {
-                                                        if (v == null) return Stream.of((Object) null);
-                                                        var res  = getter.apply(v);
-                                                        return res == null ? Stream.of((Object) null) : res.stream();
-                                                    });
+        return res;
+    }
+
+    private HashMap<FastExcelMappingNode, List<Object>> getObjectsToExport(
+            @NonNull List<Integer> accumulatedMaximalCellNumberByTreeHeight,
+            T value
+    ) {
+        HashMap<FastExcelMappingNode, List<Object>> exportObjectsByLeaf = new HashMap<>();
+        for (var l : this.leaves) exportObjectsByLeaf.put(l, new ArrayList<>());
+
+        var stack = new ArrayDeque<FastExcelNodeWithValue>();
+        stack.add(new FastExcelNodeWithValue(this.root, value));
+
+        while (!stack.isEmpty()) {
+            var parent = stack.pop();
+            var children = this.treeGraph.successors(parent.node());
+
+            stack.addAll(
+                    children
+                            .stream()
+                            .flatMap(n -> {
+
+                                        Object gotValue = getValueFromNode(n, parent.value());
+
+                                        Stream<?> resStream = Stream.of(gotValue);
+
+                                        if (n.isCollectionMapping() && gotValue instanceof Collection<?> coll) {
+                                            int requiredSize =
+                                                    accumulatedMaximalCellNumberByTreeHeight.get(n.getTreeHeight())
+                                                    / (n.getTreeHeight() + 1 == accumulatedMaximalCellNumberByTreeHeight.size() ?
+                                                            1 :
+                                                            accumulatedMaximalCellNumberByTreeHeight.get(n.getTreeHeight() + 1));
+                                            for (int i = coll.size(); i < requiredSize; i++) {
+                                                coll.add(null);
+                                            }
+                                            resStream = coll.stream();
                                         }
-
-                                        var res = valueStream.collect(Collectors.toList());
-
-                                        if (res.size() <= 1 &&
-                                                !n.isCollectionMapping() &&
-                                                !(parent.getValue() instanceof Collection<?>)) {
-                                            return new FastExcelNodeWithValue(n, res.isEmpty() ? null : res.get(0));
-                                        }
-                                        return new FastExcelNodeWithValue(n, res);
+                                        return resStream.map(o -> new FastExcelNodeWithValue(n, o));
                                     }
                             ).toList()
             );
 
+
             if (children.isEmpty()) {
-                // this is leaf so add value to appropriate column
-
-                var cellPointers =
-                        columnExportPointers.get(
-                                parent.getNode()
-                        );
-                var lastPointer = cellPointers.get(cellPointers.size() - 1);
-                var parentValue = parent.getValue();
-
-                lastPointer.setValue(parentValue);
-
-                int height = parentValue == null ? 1 :
-                        parent.getValue() instanceof Collection<?> coll ?
-                                coll.size() : 1;
-
-                // add new pointer to export
-                cellPointers.add(
-                        new FastExcelCoordinatesWithValue(
-                                new ExcelCellCoordinates(
-                                        lastPointer.coordinates.row() + height,
-                                        lastPointer.coordinates.column()),
-                                null
-                        )
-                );
+                exportObjectsByLeaf.compute(parent.node(),
+                        (k, v) -> {
+                            if (v == null) v = new ArrayList<>();
+                            v.add(parent.value());
+                            return v;
+                        });
             }
         }
-
-        //Export and fit the pointer position for table
-        exportColumnPointersToWorksheet(worksheet, columnExportPointers);
+        return exportObjectsByLeaf;
     }
 
-    private HashMap<FastExcelMappingNode, List<FastExcelCoordinatesWithValue>> createColumnValueExportPointers(
-            int startRow, int startColumn
-    ) {
-        HashMap<FastExcelMappingNode, List<FastExcelCoordinatesWithValue>> columnExportPointers =
-                new HashMap<>();
+    private Object getValueFromNode(@NonNull FastExcelMappingNode node,
+                                    Object sourceValue) {
+        if (sourceValue == null)
+            return null;
 
-        for (int i = 0; i < this.leaves.size(); i++) {
-            var leaf = this.leaves.get(i);
-            var list = new ArrayList<>(List.of(
-                    new FastExcelCoordinatesWithValue(
-                            new ExcelCellCoordinates(
-                                    startRow + leaf.getHeaderWidth() + leaf.getTreeHeight() - 1,
-                                    startColumn + i),
-                            null
-                    )
-            ));
-            columnExportPointers.put(leaf, list);
+
+        var valueStream = sourceValue instanceof Collection<?> coll ?
+                coll.stream() : Stream.of(sourceValue);
+
+        var nodeList = valueStream
+                .map(v -> v == null ? null :
+                        node.getCollectionGetter().isPresent() ?
+                                node.getCollectionGetter().get().apply(v) :
+                                node.getValueGetter()
+                                        .orElseThrow(() ->
+                                                new IllegalStateException("No getter was found in node!"))
+                                        .apply(v))
+                .collect(Collectors.toList());
+
+        if (sourceValue instanceof Collection<?>) {
+            return nodeList;
         }
 
-        return columnExportPointers;
-    }
-
-    private void exportColumnPointersToWorksheet(
-            @NonNull Worksheet worksheet,
-            @NonNull HashMap<FastExcelMappingNode, List<FastExcelCoordinatesWithValue>> columExportPointers) {
-
-        var exportValues = columExportPointers.values();
-        var setOfNumberOfExportValues = exportValues
-                .stream()
-                .map(List::size)
-                .collect(Collectors.toSet());
-
-        // validate arguments
-        if (setOfNumberOfExportValues.size() != 1) {
-            throw new IllegalArgumentException("The number of export values must be equal for each leaf (final column)!");
+        if (nodeList.isEmpty()) {
+            throw new IllegalStateException("No value was got from getters!");
         }
 
-        int numberOfExportValues = setOfNumberOfExportValues.stream().findFirst().get();
-
-        // fit export values
-        for (int i = 0; i < numberOfExportValues; i++) {
-            int effectivelyFinalIndex = i;
-            var rowMax = exportValues.stream()
-                    .map(v -> v.get(effectivelyFinalIndex).getCoordinates().row())
-                    .max(Integer::compare)
-                    .orElseThrow(() -> new IllegalStateException("Unexpected state, nothing to export ..."));
-
-            for (var exportValue : exportValues) {
-                exportValue.get(i).setCoordinates(
-                        new ExcelCellCoordinates(
-                                rowMax,
-                                exportValue.get(i).getCoordinates().column()
-                        )
-                );
-            }
-        }
-        //export values
-        var exportEntities = columExportPointers.entrySet();
-        for (var e : exportEntities) {
-
-            var mappingNode = e.getKey();
-            var exportInfo = e.getValue();
-
-            if (mappingNode.getExportMetaInfo().isEmpty()) continue;
-            var exportMetaInfo = mappingNode.getExportMetaInfo().get();
-            for (int i = 0; i < exportInfo.size() - 1; i++) {
-                int startColumn = exportInfo.get(i).getCoordinates().column();
-                int startRow = exportInfo.get(i).getCoordinates().row();
-                int endRow = exportInfo.get(i + 1).getCoordinates().row();
-
-                var exportValue = exportInfo.get(i).getValue();
-                if (exportValue != null && mappingNode.isCollectionMapping()) {
-                    var listValue = ((Collection<?>) exportValue).stream().toList();
-
-                    for (int j = startRow; j < endRow; j++) {
-                        var exportStringValue = (listValue.size() <= j - startRow) ? "" :
-                                listValue.get(j - startRow) == null ?
-                                        exportMetaInfo.valueFallback() :
-                                        listValue.get(j - startRow).toString();
-
-                        worksheet.value(j, startColumn, exportStringValue);
-                        applyStyleToCell(worksheet.style(j, startColumn), exportMetaInfo.valueStyle());
-                    }
-                } else {
-                    var exportStringValue = exportValue == null ?
-                            exportMetaInfo.valueFallback() :
-                            exportValue.toString();
-                    worksheet.value(startRow, startColumn, exportStringValue);
-                    var styleSetter = worksheet
-                            .range(startRow, startColumn,
-                                    endRow - 1, startColumn)
-                            .style();
-                    applyStyleToCell(styleSetter, exportMetaInfo.valueStyle());
-                    styleSetter.merge().set();
-                }
-            }
-
-        }
+        return nodeList.get(0);
     }
 
-    @AllArgsConstructor
-    @Setter
-    @Getter
-    private static class FastExcelCoordinatesWithValue {
-        @NonNull
-        private ExcelCellCoordinates coordinates;
-        @Nullable
-        private Object value;
+
+    private record FastExcelNodeWithValue(@NonNull FastExcelMappingNode node, @Nullable Object value) {
     }
 
-    @AllArgsConstructor
-    @Getter
-    private static class FastExcelNodeWithValue {
-        @NonNull
-        private final FastExcelMappingNode node;
-        @Nullable
-        private final Object value;
-    }
-
-    @AllArgsConstructor
-    @Getter
-    private static class FastExcelNodeWithCoordinates {
-        @NonNull
-        private final FastExcelMappingNode node;
-        @NonNull
-        private final ExcelCellCoordinates coordinates;
+    private record FastExcelNodeWithCoordinates(@NonNull FastExcelMappingNode node,
+                                                @NonNull ExcelCellCoordinates coordinates) {
     }
 
 
