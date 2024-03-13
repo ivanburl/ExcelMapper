@@ -89,9 +89,7 @@ public class FastExcelMapper<T> implements ExcelMapper<Worksheet, T> {
             var parent = this.treeGraph.predecessors(node);
             if (parent.isEmpty()) continue;
             if (parent.size() != 1) {
-                throw new IllegalStateException("Graph must be tree, " +
-                        "but for number of parents for node " +
-                        "is bigger than 1");
+                throw new IllegalStateException("Graph must be tree");
             }
             node.setTreeHeight(parent.stream().findFirst().get().getTreeHeight() + 1);
         }
